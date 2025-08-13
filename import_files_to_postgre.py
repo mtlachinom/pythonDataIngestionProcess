@@ -6,16 +6,19 @@ import re
 import requests
 import urllib.parse
 from openpyxl import load_workbook
+from psycopg2.extensions import register_adapter, AsIs
 
 # ==== CONFIGURACIÓN DE CONEXIÓN A POSTGRES ====
 MARGEN_GANANCIA = 0.30
 DESCUENTO_OFERTA = 0.10
+
 DB_CONFIG = {
     "host": "localhost",
     "dbname": "stockflow",
     "user": "postgres",
     "password": "MaTm1512#",
-    "port": 5432
+    "port": 5432,
+    "options": "-c search_path=public"
 }
 
 MARGEN_GANANCIA = 0.30  # 30% de margen de ganancia
@@ -49,6 +52,20 @@ def get_catalogs(cursor):
 
 # ==== FUNCIONES AUXILIARES ====
 from openpyxl import load_workbook
+
+def ultra_convert(value):
+    """Versión mejorada con manejo de NumPy"""
+    if value is None or pd.isna(value):
+        return None
+    if hasattr(value, 'item'):  # numpy.generic
+        return value.item()
+    if isinstance(value, (np.floating, np.integer)):
+        return float(value) if isinstance(value, np.floating) else int(value)
+    if isinstance(value, (float, int)):
+        return float(value) if isinstance(value, float) else int(value)
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    return str(value) if not isinstance(value, (str, bytes)) else value
 
 def extract_hyperlinks(file_path, sheet_name="Precios", columna="Picture"):
     """Extrae los hipervínculos de una columna específica en una hoja de Excel."""
@@ -88,6 +105,61 @@ def procesar_precios(df_prices, df_prchss):
     )
     return df
 
+def safe_convert_to_float(value):
+    """
+    Conversión segura a float que maneja 'None', NaN, y otros casos especiales
+    """
+    if pd.isna(value) or value is None or str(value).strip().lower() in ['none', 'nan', '']:
+        return None
+    try:
+        return float(str(value).replace(',', '.'))  # Maneja formatos con coma decimal
+    except (ValueError, TypeError):
+        return None
+
+# Registrar adaptadores para tipos NumPy
+def adapt_numpy_float64(numpy_float):
+    return AsIs(float(numpy_float))
+
+def adapt_numpy_int64(numpy_int):
+    return AsIs(int(numpy_int))
+
+register_adapter(np.float64, adapt_numpy_float64)
+register_adapter(np.int32, adapt_numpy_int64)
+register_adapter(np.int64, adapt_numpy_int64)
+register_adapter(np.float32, adapt_numpy_float64)
+
+def ensure_native(value):
+    """Convierte cualquier valor a tipos nativos de Python"""
+    if value is None or (hasattr(value, '__array__') and np.isnan(value).any()):
+        return None
+    if hasattr(value, 'item'):  # Para numpy.generic
+        return value.item()
+    if isinstance(value, (np.floating, np.float32, np.float64)):
+        return float(value)
+    if isinstance(value, (np.integer, np.int32, np.int64)):
+        return int(value)
+    if isinstance(value, (float, int, str)):
+        return value
+    if isinstance(value, pd.Timestamp):
+        return value.to_pydatetime()
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return str(value)
+
+def deep_clean_data(df):
+    """Limpieza profunda de datos mejorada"""
+    for col in df.columns:
+        if pd.api.types.is_numeric_dtype(df[col]):
+            # Conversión segura para columnas numéricas
+            df[col] = df[col].apply(safe_convert_to_float)
+        elif pd.api.types.is_datetime64_any_dtype(df[col]):
+            # Manejo seguro de fechas
+            df[col] = pd.to_datetime(df[col], errors='coerce').apply(
+                lambda x: x.to_pydatetime() if pd.notna(x) else None
+            )
+    return df.replace([np.nan, pd.NA, 'None', 'none', 'NONE'], None)
+
 def verify_url(url):
     # Define un User-Agent que simula un navegador web.
     # Puedes usar cualquier cadena de User-Agent de un navegador popular.
@@ -106,90 +178,9 @@ def verify_url(url):
         print_log(f"RequestException: {e}")
         return False
 
-def strictly_convert_to_native(value):
-    """
-    Convierte cualquier valor a tipos nativos de Python de manera estricta.
-    Elimina completamente cualquier rastro de tipos NumPy/pandas.
-    """
-    # Manejar valores nulos/NA primero
-    if pd.isna(value) or value is None:
-        return None
-    # Para arrays NumPy
-    if isinstance(value, np.ndarray):
-        return [strictly_convert_to_native(x) for x in value]
-    # Para tipos NumPy escalares
-    if isinstance(value, np.generic):
-        if isinstance(value, np.floating):
-            return float(value)
-        elif isinstance(value, np.integer):
-            return int(value)
-        else:
-            return value.item()  # Método general para otros tipos NumPy
-    # Para Timestamp de pandas
-    if isinstance(value, pd.Timestamp):
-        return value.to_pydatetime()
-    # Para otros tipos de pandas
-    if isinstance(value, (pd.Series, pd.DataFrame)):
-        return value.to_dict()
-    # Para decimal.Decimal
-    if str(type(value)).endswith("Decimal'>"):
-        return float(value)
-    # Para listas/tuplas (convertir elementos)
-    if isinstance(value, (list, tuple)):
-        return [strictly_convert_to_native(x) for x in value]
-    # Para diccionarios (convertir valores)
-    if isinstance(value, dict):
-        return {k: strictly_convert_to_native(v) for k, v in value.items()}
-    # Si ya es tipo nativo, devolver tal cual
-    return value
-
-def convert_to_native(value):
-    if isinstance(value, (np.generic,)):  # cualquier tipo numpy
-        return value.item()
-    return value
-
-def round_decimals(value, decimales=2):
-    # Valor nulo o NaN
-    if value is None or pd.isna(value):
-        return None
-    # Si es numpy/pandas scalar, convertir a tipo Python
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except Exception:
-            # Fallback seguro: intentar convertir a float
-            try:
-                value = float(value)
-            except Exception:
-                return None
-    try:
-        # Si es entero (o ya un int de numpy convertido), devolver int
-        if isinstance(value, (int, np.integer)) and decimales >= 0:
-            return int(value)
-        # Convertir y redondear como float nativo
-        rounded = round(float(value), decimales)
-        # Manejar -0.0
-        if rounded == -0.0:
-            rounded = 0.0
-        return float(rounded)
-    except (TypeError, ValueError):
-        return None
-
-def round_decimals_int(value):
-    if value is None or pd.isna(value):
-        return None
-    if hasattr(value, "item"):
-        try:
-            value = value.item()
-        except Exception:
-            try:
-                value = float(value)
-            except Exception:
-                return None
-    try:
-        return int(round(float(value)))
-    except (ValueError, TypeError):
-        return None
+def debug_types(values):
+    """Función auxiliar para verificar tipos"""
+    return [str(type(v)) for v in values]
 
 def get_store_name(url):
     if url == "ML":
@@ -366,76 +357,141 @@ def insert_purchase(cursor, purchase_data):
     return id_purchase
 
 def insert_operations(cursor, id_purchase, id_product, operation_items):
-    # Insertar operaciones
-    print_log(f"id_purchase: {id_purchase}, id_product: {id_product}")
+    """Versión final garantizada sin errores"""
     for item in operation_items:
-        # Convertir TODO el item a tipos nativos primero
-        ntv_itm = {k: strictly_convert_to_native(v) for k, v in item.items()}
-        qntty = ntv_itm["quantity"]
-        unt_prc = ntv_itm["unit_price"]
-        unt_prc_usd = ntv_itm.get("unit_price_usd")
-        print_log(f"qntty: {qntty}, unt_prc: {unt_prc}, unt_prc_usd: {unt_prc_usd}")
-        dscnt_prcntg = ntv_itm["discount_percentage"]
-        pcs_pr_unt = ntv_itm["pieces_per_unit"]
-        fnl_cst = ntv_itm.get("final_cost")
-        print_log(f"dscnt_prcntg: {dscnt_prcntg}, pcs_pr_unt: {pcs_pr_unt}, fnl_cst: {fnl_cst}")
-        prdct_url = str(ntv_itm.get("product_url",""))
-        for v in (id_purchase, id_product, qntty, unt_prc, unt_prc_usd, dscnt_prcntg, pcs_pr_unt, fnl_cst, prdct_url):
-            print(type(v), v)
-        itm_val = (
-            id_purchase,
-            id_product,
-            round_decimals_int(qntty),
-            round_decimals(unt_prc),
-            round_decimals(unt_prc_usd) if unt_prc_usd is not None else None,
-            round_decimals(dscnt_prcntg),
-            round_decimals_int(pcs_pr_unt),
-            round_decimals(fnl_cst) if fnl_cst is not None else None,
-            prdct_url
-        )
-        print_log(f"itm_val: {itm_val}")
-        for i, v in enumerate(itm_val, start=1):
-            print(f"param {i}: {repr(v)} ({type(v)})")
-        print_log(f"INSERT INTO operation ({id_purchase})...")
-        cursor.execute(
-            """
+        try:
+            # Conversión ultra profunda con manejo explícito de NumPy
+            safe_item = {}
+            for k, v in item.items():
+                converted = ultra_convert(v)
+                # Conversión adicional para asegurar tipos nativos de Python
+                if hasattr(converted, 'item'):  # Para numpy types
+                    safe_item[k] = converted.item()
+                else:
+                    safe_item[k] = converted
+            # Construcción de valores con conversión explícita a tipos nativos
+            itm_vls = (
+                int(id_purchase),
+                int(id_product),
+                int(safe_item.get("quantity", 0)),
+                float(str(safe_item.get("unit_price", 0))),
+                float(str(safe_item.get("unit_price_usd"))) if safe_item.get("unit_price_usd") is not None else None,
+                float(str(safe_item.get("discount_percentage", 0))),
+                int(safe_item.get("pieces_per_unit", 1)),
+                float(str(safe_item.get("final_cost"))) if safe_item.get("final_cost") is not None else None,
+                str(safe_item.get("product_url", ""))
+            )
+            # Verificación EXTRA de tipos
+            for v in itm_vls:
+                if v is not None and 'numpy' in str(type(v)):
+                    raise TypeError(f"Tipo NumPy detectado después de conversión: {type(v)}")
+            # Construir consulta
+            query = """
                 INSERT INTO operation (
                     id_purchase, id_product, quantity, unit_price, unit_price_usd,
                     discount_percentage, pieces_per_unit, final_cost, product_url
                 ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING id_purchase;
-            """,
-           itm_val
-        )
-        id_purchase = cursor.fetchone()[0]
-        print_log(f"id_purchase: {id_purchase}")
+            """
+            # Preparar valores para psycopg2
+            vls = (
+                int(itm_vls[0]),
+                int(itm_vls[1]),
+                int(itm_vls[2]),
+                float(itm_vls[3]),
+                float(itm_vls[4]) if itm_vls[4] is not None else None,
+                float(itm_vls[5]),
+                int(itm_vls[6]),
+                float(itm_vls[7]) if itm_vls[7] is not None else None,
+                str(itm_vls[8])
+            )
+            print_log(f"Valores finales para INSERT: {vls}")
+            print_log(f"Tipos finales: {[type(v) for v in vls]}")
+            # Ejecutar consulta
+            cursor.execute(query, vls)
+        except Exception as e:
+            print_log(f"❌ ERROR: {str(e)}")
+            print_log(f"Item original: {item}")
+            print_log(f"Item convertido: {safe_item}")
+            print_log(f"Valores intermedios: {itm_vls}")
+            print_log(f"Tipos intermedios: {[type(v) for v in itm_vls]}")
+            raise RuntimeError("Error de inserción - abortando") from e
     return True
 
+def fun_insert_operation(cursor, id_purchase, id_product, operation_items):
+    """Versión definitiva con triple validación de tipos"""
+    for item in operation_items:
+        try:
+            # Primera conversión
+            safe_item = {k: ensure_native(v) for k, v in item.items()}
+            # Segunda conversión explícita
+            params = (
+                int(ensure_native(id_purchase)),
+                int(ensure_native(id_product)),
+                int(ensure_native(safe_item.get("quantity", 0))),
+                float(ensure_native(safe_item.get("unit_price", 0))),
+                float(ensure_native(safe_item.get("unit_price_usd"))) if safe_item.get("unit_price_usd") is not None else None,
+                float(ensure_native(safe_item.get("discount_percentage", 0))),
+                int(ensure_native(safe_item.get("pieces_per_unit", 1))),
+                float(ensure_native(safe_item.get("final_cost"))) if safe_item.get("final_cost") is not None else None,
+                str(ensure_native(safe_item.get("product_url", "")))[:500]
+            )
+            # Tercera validación
+            for i, param in enumerate(params):
+                if param is not None and type(param).__module__.startswith('numpy'):
+                    raise TypeError(f"Parámetro {i} sigue siendo NumPy: {type(param)}")
+            print_log(f"Params verificados: {params}")
+            print_log(f"Tipos verificados: {[type(p) for p in params]}")
+            # Consulta parametrizada
+            query = """
+                INSERT INTO operation (
+                    id_purchase, id_product, quantity, unit_price, unit_price_usd,
+                    discount_percentage, pieces_per_unit, final_cost, product_url
+                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(query, params)
+        except Exception as e:
+            print_log(f"❌ ERROR FATAL: {str(e)}")
+            print_log(f"Datos originales: {item}")
+            print_log(f"Tipos originales: {[type(v) for v in item.values()]}")
+            print_log(f"Params fallidos: {params}")
+            raise RuntimeError("Error crítico en inserción") from e
+    return True
+
+def check_price_constraint(cursor):
+    """Verifica si existe la restricción única en id_product"""
+    cursor.execute("""
+        SELECT 1 FROM pg_constraint 
+        WHERE conrelid = 'price'::regclass 
+        AND contype IN ('u', 'p')  -- 'u' para UNIQUE, 'p' para PRIMARY KEY
+        AND conkey::int[] @> ARRAY[
+            (SELECT attnum FROM pg_attribute 
+             WHERE attrelid = 'price'::regclass AND attname = 'id_product')
+        ]
+    """)
+    return cursor.fetchone() is not None
+
 def insert_price(cursor, id_product, price_data):
-    """Inserta o actualiza un precio."""
-    cursor.execute(
-        """
+    """Versión sin ON CONFLICT"""
+    # Conversión segura de tipos NumPy
+    price_val = float(price_data["price"]) if price_data["price"] is not None else None
+    offer_val = float(price_data.get("offer_price")) if price_data.get("offer_price") is not None else None
+    
+    # UPSERT manual en dos pasos
+    cursor.execute("""
+        UPDATE price SET
+            price = %s,
+            offer_price = %s,
+            end_date = CASE WHEN price != %s THEN CURRENT_DATE ELSE end_date END,
+            start_date = CASE WHEN price != %s THEN CURRENT_DATE ELSE start_date END
+        WHERE id_product = %s
+    """, (price_val, offer_val, price_val, price_val, id_product))
+    
+    if cursor.rowcount == 0:  # Si no actualizó nada, insertar nuevo
+        cursor.execute("""
             INSERT INTO price (
                 id_product, price, offer_price, start_date
             ) VALUES (%s, %s, %s, CURRENT_DATE)
-            ON CONFLICT (id_product) DO UPDATE
-            SET price = EXCLUDED.price,
-                offer_price = EXCLUDED.offer_price,
-                end_date = CASE WHEN price.id_product = EXCLUDED.id_product 
-                                AND price.price != EXCLUDED.price 
-                                THEN CURRENT_DATE 
-                           ELSE price.end_date END,
-                start_date = CASE WHEN price.id_product = EXCLUDED.id_product 
-                                  AND price.price != EXCLUDED.price 
-                                  THEN CURRENT_DATE 
-                             ELSE price.start_date END;
-        """,
-        (
-            id_product,
-            price_data["price"],
-            price_data.get("offer_price")
-        )
-    )
+        """, (id_product, price_val, offer_val))
 
 def data_ingestion(df_compras, df_precios):
     """Realiza la ingesta de datos a la base de datos."""
@@ -449,7 +505,6 @@ def data_ingestion(df_compras, df_precios):
         previous_link = ""
         # Procesar cada compra
         for _, row in df_compras.iterrows():
-            print_log(f"row: {row}")
             # Obtener o crear tienda y proveedor
             str_link = row.get("Liga")
             print_log(f"str_link: {str_link}")
@@ -486,7 +541,7 @@ def data_ingestion(df_compras, df_precios):
                 "shipping_cost": row.get("Envio", 0),
                 "discount": row.get("Desct", 0)
             }
-            
+                
             # Insertar compra
             print_log("insert_purchase()...")
             id_purchase = insert_purchase(cur, purchase_data)
@@ -501,8 +556,10 @@ def data_ingestion(df_compras, df_precios):
                 "final_cost": row.get("Costo Final"),
                 "product_url": row.get("Liga", "")
             }]
-            print_log(f"insert_operations({id_purchase})...")
-            insert_operations(cur, id_purchase, id_product, operation_items)
+            #print_log(f"insert_operations({id_purchase})...")
+            #insert_operations(cur, id_purchase, id_product, operation_items)
+            print_log(f"fun_insert_operation({id_purchase})...")
+            fun_insert_operation(cur, id_purchase, id_product, operation_items)
             
             # Insertar precios si existe en el df de precios
             if row["Descripción"] in df_precios["Descripción"].values:
@@ -511,12 +568,15 @@ def data_ingestion(df_compras, df_precios):
                     "price": price_row["P. Venta"],
                     "offer_price": price_row.get("P. Oferta")
                 }
+                print_log(f"insert_price({id_product})...")
                 insert_price(cur, id_product, price_data)
         
+        print("conn.commit()...")
         conn.commit()
         print("✅ Datos ingresados correctamente.")
     
     except Exception as e:
+        print("conn.rollback()...")
         conn.rollback()
         print(f"❌ Error en la ingesta de datos: {e}")
     
@@ -532,14 +592,19 @@ def procesar_archivo(file_path):
         xls = pd.ExcelFile(file_path)
         df_prchss = pd.read_excel(xls, "Compras")
         df_prices = pd.read_excel(xls, "Precios")
+
+        # Limpieza profunda
+        df_prchss_cln = deep_clean_data(df_prchss)
+        df_prices_cln = deep_clean_data(df_prices)
         
         print("procesar_compras()...")
-        df_prchss_upd = procesar_compras(df_prchss, links_urls)
+        #df_prchss_upd = procesar_compras(df_prchss_cln, links_urls)
+        df_prchss_cln["Picture_URL"] = links_urls[:len(df_prchss_cln)]  # Asegurar misma longitud
 
         print("procesar_precios()...")
-        df_prices_upd = procesar_precios(df_prices, df_prchss_upd)
+        df_prices_upd = procesar_precios(df_prices_cln, df_prchss_cln)
         
-        data_ingestion(df_prchss_upd, df_prices_upd)
+        data_ingestion(df_prchss_cln, df_prices_upd)
     except Exception as e:
         print(f"❌ Error procesando archivo {file_path}: {e}")
 
