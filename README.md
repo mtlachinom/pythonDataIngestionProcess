@@ -106,4 +106,6 @@ pip install --upgrade pip
 
 python import_files_to_postgre.py
 
+python pdf_to_xlsx.py
+
 ###  End Proof Concept Import CSV to RDS  ###
